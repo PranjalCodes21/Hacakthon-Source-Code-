@@ -1,0 +1,30 @@
+bundle:
+  name: winback-agent
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog for all tables
+    default: workspace
+  schema:
+    description: Schema for synthetic data and agent outputs
+    default: chiro_hackathon
+  llm_endpoint:
+    description: Databricks model serving endpoint the agent uses
+    default: databricks-meta-llama-3-3-70b-instruct
+  max_actions:
+    description: Max patients the agent may contact per run
+    default: "15"
+  lapsed_days:
+    description: Days without a visit before a patient counts as lapsed
+    default: "180"
+  capacity_share:
+    description: Fraction of each clinic's weekly open slots one run may fill
+    default: "0.02"
+
+targets:
+  dev:
+    mode: development
+    default: true

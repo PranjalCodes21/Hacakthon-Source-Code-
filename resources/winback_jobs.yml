@@ -1,0 +1,47 @@
+# Two jobs, both serverless (no cluster specified):
+#   winback_data_job  - generate synthetic data and build summary tables (slow, run once)
+#   winback_agent_job - run the agent, then simulate outcomes (run as often as you like)
+
+resources:
+  jobs:
+    winback_data_job:
+      name: winback-data-${bundle.target}
+      tasks:
+        - task_key: generate_data
+          notebook_task:
+            notebook_path: ../src/00_generate_data.py   # match the generator's real extension
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+
+        - task_key: setup_tables
+          depends_on:
+            - task_key: generate_data
+          notebook_task:
+            notebook_path: ../src/01_setup_tables.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+
+    winback_agent_job:
+      name: winback-agent-${bundle.target}
+      tasks:
+        - task_key: run_agent
+          notebook_task:
+            notebook_path: ../src/02_winback_agent.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              llm_endpoint: ${var.llm_endpoint}
+              max_actions: ${var.max_actions}
+              lapsed_days: ${var.lapsed_days}
+              capacity_share: ${var.capacity_share}
+
+        - task_key: simulate_outcomes
+          depends_on:
+            - task_key: run_agent
+          notebook_task:
+            notebook_path: ../src/03_simulate_outcomes.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
