@@ -9,6 +9,12 @@ back as text starting with "ERROR" so the agent can change its plan instead of c
 The tools do all the math and enforce the business rules (capacity limits,
 no duplicate contacts, holdout assignment). The LLM decides what to investigate and what to do.
 
+Candidate ranking: find_lapsed_patients scores every lapsed patient in SQL with
+expected_return = est_annual_value x likelihood, where likelihood is a heuristic built from
+recency, visit habit, no-show/cancellation rate, and whether their last provider is still active.
+The LLM gets one pre-ranked list instead of ranking dozens of patients itself (saves tokens).
+The weights below are assumptions; holdout lift is how they would be calibrated over time.
+
 Holdout group: a random share of patients the agent chooses (holdout_share) is recorded but
 NOT contacted. Comparing their return rate with contacted patients measures the lift that
 outreach actually caused. Assignment is a hash of run_id + patient_id, so it is reproducible
@@ -47,6 +53,16 @@ FILTERS = {
     "never_started_care": "consult_only",
     "frequent_no_shows": "n_no_shows >= 2",
 }
+
+# Likelihood heuristic weights (tunable).
+RECENCY_DECAY_DAYS = 365.0     # likelihood falls by ~63% per year beyond the lapse threshold
+CONSULT_ONLY_FACTOR = 0.5      # never started care: commitment unproven
+HABIT_BASE = 0.4               # habit factor = min(1, HABIT_BASE + HABIT_PER_VISIT * n_visits)
+HABIT_PER_VISIT = 0.1
+NO_SHOW_PENALTY = 1.5          # reliability = max(RELIABILITY_FLOOR, 1 - penalty * miss_rate)
+CANCEL_WEIGHT = 0.5            # a cancellation counts as half a no-show
+RELIABILITY_FLOOR = 0.2
+INACTIVE_PROVIDER_FACTOR = 0.7 # relationship gone; needs a new provider introduction
 
 
 def _lit(value):
@@ -217,7 +233,7 @@ class WinbackTools:
         return ("Clinics from least to most utilized. remaining_budget_this_run = how many more "
                 "patients you may route there in this run.\n" + _fmt(rows))
 
-    def find_lapsed_patients(self, situation=None, home_location_id=None, limit=15):
+    def find_lapsed_patients(self, situation=None, home_location_id=None, limit=25):
         d = self.lapsed_days
         limit = max(1, min(int(limit), 30))
         where = [f"days_since_last_visit >= {d}",
@@ -233,16 +249,49 @@ class WinbackTools:
                 return "ERROR: invalid home_location_id"
             where.append(f"home_location_id = {_lit(home_location_id)}")
         rows = self.sql(f"""
-            SELECT patient_id, days_since_last_visit, n_visits, est_annual_value,
-                   home_location_id, last_location_id, last_provider_active,
-                   last_service_type, consult_only, n_no_shows, n_cancellations, n_appointments
-            FROM {self.fq}.patient_summary
-            WHERE {' AND '.join(where)}
-            ORDER BY est_annual_value DESC
+            WITH base AS (
+              SELECT patient_id,
+                     days_since_last_visit              AS days,
+                     n_visits,
+                     COALESCE(est_annual_value, 0)      AS value,
+                     home_location_id                   AS home,
+                     last_location_id                   AS last_loc,
+                     last_provider_active               AS prov_active,
+                     consult_only,
+                     n_no_shows                         AS no_shows,
+                     n_cancellations                    AS cancels,
+                     n_appointments,
+                     CASE WHEN NOT last_provider_active THEN 'provider_inactive'
+                          WHEN n_no_shows >= 2          THEN 'frequent_no_shows'
+                          WHEN consult_only             THEN 'never_started_care'
+                          ELSE 'high_value_lapsed' END  AS situation
+              FROM {self.fq}.patient_summary
+              WHERE {' AND '.join(where)}
+            ),
+            scored AS (
+              SELECT *,
+                     EXP(-(days - {d}) / {RECENCY_DECAY_DAYS})
+                     * CASE WHEN consult_only THEN {CONSULT_ONLY_FACTOR}
+                            ELSE LEAST(1.0, {HABIT_BASE} + {HABIT_PER_VISIT} * n_visits) END
+                     * GREATEST({RELIABILITY_FLOOR},
+                                1 - {NO_SHOW_PENALTY} * (no_shows + {CANCEL_WEIGHT} * cancels)
+                                    / GREATEST(n_appointments, 1))
+                     * CASE WHEN prov_active THEN 1.0 ELSE {INACTIVE_PROVIDER_FACTOR} END
+                     AS likelihood
+              FROM base
+            )
+            SELECT patient_id, situation, days, n_visits, no_shows, cancels, home, last_loc,
+                   CAST(ROUND(value) AS DOUBLE)              AS value,
+                   CAST(ROUND(likelihood, 2) AS DOUBLE)      AS likelihood,
+                   CAST(ROUND(value * likelihood) AS DOUBLE) AS expected_return
+            FROM scored
+            ORDER BY expected_return DESC
             LIMIT {limit}""")
         label = situation or "any"
-        return (f"Lapsed patients not yet contacted (situation={label}), highest value first:\n"
-                + _fmt(rows))
+        return (f"Lapsed patients not yet contacted (situation={label}), ranked by "
+                "expected_return = value x likelihood. likelihood is a heuristic from recency, "
+                "visit habit, no-show/cancellation rate, and last-provider status. "
+                "'situation' is the suggested reason_category.\n" + _fmt(rows))
 
     def get_patient_profile(self, patient_id):
         if not SAFE_ID.match(str(patient_id)):
@@ -387,10 +436,12 @@ TOOL_SPECS = [
     _fn("get_location_capacity",
         "List clinics with utilization, open slots, region, and how many more patients you may route there this run."),
     _fn("find_lapsed_patients",
-        "Find lapsed patients not yet contacted, highest estimated value first. Optionally filter by situation or home clinic.",
+        "Find lapsed patients not yet contacted, already ranked by expected return (value x likelihood of "
+        "winning them back), with a suggested situation per patient. Call once without filters for the "
+        "full candidate pool; filter by situation or home clinic only if you need more of a specific group.",
         {"situation": {"type": "string", "enum": list(FILTERS)},
          "home_location_id": {"type": "string"},
-         "limit": {"type": "integer", "description": "1-30, default 15"}}),
+         "limit": {"type": "integer", "description": "1-30, default 25"}}),
     _fn("get_patient_profile",
         "Full facts for one patient: summary, recent visits, appointment outcomes, home clinic budget.",
         {"patient_id": {"type": "string"}}, ["patient_id"]),
@@ -399,7 +450,8 @@ TOOL_SPECS = [
         {"location_id": {"type": "string"}}, ["location_id"]),
     _fn("record_winback_action",
         "Record a decision to contact a lapsed patient, routed to a clinic, for staff approval. "
-        "Some patients are automatically assigned to a holdout group and not contacted.",
+        "Some patients are automatically assigned to a holdout group and not contacted. "
+        "You may issue several of these calls in one turn.",
         {"patient_id": {"type": "string"},
          "target_location_id": {"type": "string"},
          "target_provider_id": {"type": "string", "description": "Optional active provider at the target clinic"},
@@ -409,7 +461,7 @@ TOOL_SPECS = [
          "priority": {"type": "string", "enum": ["high", "medium", "low"]}},
         ["patient_id", "target_location_id", "reason_category", "reasoning", "outreach_message", "priority"]),
     _fn("skip_patient",
-        "Record a decision NOT to contact a patient, with the reason.",
+        "Record a decision NOT to contact a patient, with the reason. You may issue several in one turn.",
         {"patient_id": {"type": "string"}, "reasoning": {"type": "string"}},
         ["patient_id", "reasoning"]),
 ]
