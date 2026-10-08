@@ -71,7 +71,7 @@ WHERE ((a.action_type = 'contact' AND a.status IN ('proposed', 'approved'))
 """).collect()
 
 if not decisions:
-    dbutils.notebook.exit("No new decisions to simulate.")
+    print("No new decisions to simulate. Showing existing results.")
 
 rng = random.Random(42)  # repeatable
 rows = []
@@ -123,10 +123,9 @@ ORDER BY 1, 2
 # DBTITLE 1,Overall lift
 # Overall lift: what outreach caused beyond patients who would have returned anyway.
 display(spark.sql(f"""
-SELECT 'contacted' AS arm,
-       COUNT(*) AS patients,
-       ROUND(AVG(CASE WHEN outcome = 'rebooked' THEN 1.0 ELSE 0.0 END), 3) AS rebook_rate
-FROM {FQ}.winback_outcomes
-GROUP BY 1
-ORDER BY 1
-"""))
+    SELECT COALESCE(arm, 'contacted') AS arm,
+           COUNT(*) AS patients,
+           ROUND(AVG(CASE WHEN outcome = 'rebooked' THEN 1.0 ELSE 0.0 END), 3) AS rebook_rate
+    FROM {FQ}.winback_outcomes
+    GROUP BY 1
+    ORDER BY 1"""))
