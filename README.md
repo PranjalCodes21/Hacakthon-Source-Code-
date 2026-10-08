@@ -106,4 +106,4 @@ No secrets or workspace-specific values are stored in this repo.
 
 ## Team
 
-Pranjal Paudel and Bishwash Bhattarai
+Pranjal Paudel and Biswash Bhattarai
